@@ -37,13 +37,32 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.tools import tool
 from appworld import AppWorld, load_task_ids
 
-# Try to use litellm for more reliable API calls, fallback to langchain_google_genai
+# Try multiple options for LLM - litellm is more reliable
+USE_LITELLM = False
+ChatLiteLLM = None
+ChatGoogleGenerativeAI = None
+
+# Option 1: Try langchain-litellm (newer package)
 try:
-    from langchain_community.chat_models import ChatLiteLLM
+    from langchain_litellm import ChatLiteLLM
     USE_LITELLM = True
 except ImportError:
-    from langchain_google_genai import ChatGoogleGenerativeAI
-    USE_LITELLM = False
+    pass
+
+# Option 2: Try langchain_community ChatLiteLLM
+if not USE_LITELLM:
+    try:
+        from langchain_community.chat_models import ChatLiteLLM
+        USE_LITELLM = True
+    except ImportError:
+        pass
+
+# Option 3: Fall back to langchain_google_genai
+if not USE_LITELLM:
+    try:
+        from langchain_google_genai import ChatGoogleGenerativeAI
+    except ImportError:
+        raise ImportError("No LLM backend available. Install: pip install langchain-litellm or langchain-google-genai")
 
 
 # Global reference to the active agent instance (needed for tools)
@@ -377,24 +396,40 @@ print(login_result['access_token'])
         """Initialize the LLM and compensation agent."""
         print(f"[INFO] Initializing LLM: {self.model_name} (litellm={USE_LITELLM})")
 
-        if USE_LITELLM:
+        timeout = int(os.getenv("LLM_TIMEOUT", "120"))
+        max_retries = int(os.getenv("LLM_MAX_RETRIES", "5"))
+
+        if USE_LITELLM and ChatLiteLLM is not None:
             # Use litellm for better reliability
             model_id = f"gemini/{self.model_name}" if not self.model_name.startswith("gemini/") else self.model_name
-            self.llm = ChatLiteLLM(
-                model=model_id,
-                api_key=self.google_api_key,
-                timeout=int(os.getenv("LLM_TIMEOUT", "120")),
-                max_retries=int(os.getenv("LLM_MAX_RETRIES", "5")),
-                temperature=0,
-            )
+            try:
+                self.llm = ChatLiteLLM(
+                    model=model_id,
+                    api_key=self.google_api_key,
+                    timeout=timeout,
+                    max_retries=max_retries,
+                    temperature=0,
+                )
+            except Exception as e:
+                print(f"[WARN] ChatLiteLLM failed: {e}, falling back to ChatGoogleGenerativeAI")
+                self.llm = None
         else:
+            self.llm = None
+
+        # Fallback to ChatGoogleGenerativeAI
+        if self.llm is None and ChatGoogleGenerativeAI is not None:
+            # Use request_timeout instead of timeout for better compatibility
             self.llm = ChatGoogleGenerativeAI(
                 model=self.model_name,
                 google_api_key=self.google_api_key,
-                timeout=int(os.getenv("LLM_TIMEOUT", "120")),
-                max_retries=int(os.getenv("LLM_MAX_RETRIES", "5")),
+                timeout=timeout,
+                max_retries=max_retries,
                 temperature=0,
+                transport="rest",  # Use REST instead of gRPC (more reliable)
             )
+
+        if self.llm is None:
+            raise RuntimeError("Could not initialize any LLM backend")
 
         system_prompt = "You are a Venmo assistant. Use the provided tools to complete tasks. Call complete_task() when done."
 
