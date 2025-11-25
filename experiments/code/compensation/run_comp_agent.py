@@ -88,7 +88,7 @@ def send_payment(receiver_email: str, amount: float, description: str = "") -> s
         description: Optional note for the payment
 
     Returns:
-        JSON with transaction_id on success, or error message
+        JSON with transaction_id on success, or raises exception on failure
     """
     agent = _get_agent()
     try:
@@ -105,9 +105,21 @@ import json
 print(json.dumps(result))
 """
         output = agent.world.execute(code)
-        return output.strip() if output else '{"error": "No response"}'
+        result_str = output.strip() if output else ""
+
+        # Check if the result indicates an error
+        if "Execution failed" in result_str or "Exception:" in result_str or "Error:" in result_str:
+            # Raise exception so middleware detects failure and triggers compensation
+            raise RuntimeError(f"Payment failed: {result_str}")
+
+        if not result_str:
+            raise RuntimeError("Payment failed: No response from Venmo API")
+
+        return result_str
+    except RuntimeError:
+        raise  # Re-raise our explicit errors
     except Exception as e:
-        return json.dumps({"error": str(e), "success": False})
+        raise RuntimeError(f"Payment failed: {str(e)}")
 
 
 @tool
@@ -123,7 +135,7 @@ def request_refund(receiver_email: str, amount: float, description: str = "Refun
         description: Note explaining the refund request
 
     Returns:
-        JSON with payment_request_id on success, or error message
+        JSON with payment_request_id on success, or raises exception on failure
     """
     agent = _get_agent()
     try:
@@ -131,21 +143,29 @@ def request_refund(receiver_email: str, amount: float, description: str = "Refun
         desc = description.replace("'", "\\'").replace('"', '\\"') if description else "Refund request"
         code = f'''
 import json
-try:
-    result = apis.venmo.create_payment_request(
-        user_email="{receiver_email}",
-        amount={amount},
-        access_token="{token}",
-        description="{desc}"
-    )
-    print(json.dumps(result))
-except Exception as e:
-    print(json.dumps({{"error": str(e), "success": False}}))
+result = apis.venmo.create_payment_request(
+    user_email="{receiver_email}",
+    amount={amount},
+    access_token="{token}",
+    description="{desc}"
+)
+print(json.dumps(result))
 '''
         output = agent.world.execute(code)
-        return output.strip() if output else '{"error": "No response"}'
+        result_str = output.strip() if output else ""
+
+        # Check if the result indicates an error
+        if "Execution failed" in result_str or "Exception:" in result_str or "Error:" in result_str:
+            raise RuntimeError(f"Refund request failed: {result_str}")
+
+        if not result_str:
+            raise RuntimeError("Refund request failed: No response from Venmo API")
+
+        return result_str
+    except RuntimeError:
+        raise
     except Exception as e:
-        return json.dumps({"error": str(e), "success": False})
+        raise RuntimeError(f"Refund request failed: {str(e)}")
 
 
 @tool
@@ -338,7 +358,12 @@ print(json.dumps(result))
             print(f"[WARN] Could not cache balance: {e}")
 
     def _map_payment_state(self, result: Any, params: dict) -> dict:
-        """Extract state from payment result for potential compensation."""
+        """
+        Extract state from payment result for potential compensation.
+
+        This mapper is used by the CompensationMiddleware to construct
+        parameters for the request_refund tool when rolling back a send_payment.
+        """
         # Parse result if it's a string
         if isinstance(result, str):
             try:
@@ -346,15 +371,13 @@ print(json.dumps(result))
             except:
                 pass
 
-        state = {
+        # Return params needed by request_refund tool
+        # request_refund(receiver_email, amount, description)
+        return {
             "receiver_email": params.get("receiver_email"),
             "amount": params.get("amount"),
+            "description": f"Refund for failed transaction"
         }
-
-        if isinstance(result, dict):
-            state["transaction_id"] = result.get("transaction_id")
-
-        return state
 
     def _get_venmo_token(self) -> str:
         """Get or cache Venmo access token for the supervisor."""
