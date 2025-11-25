@@ -431,7 +431,22 @@ print(login_result['access_token'])
         if self.llm is None:
             raise RuntimeError("Could not initialize any LLM backend")
 
-        system_prompt = "You are a Venmo assistant. Use the provided tools to complete tasks. Call complete_task() when done."
+        system_prompt = """You are a Venmo assistant that ensures payment integrity.
+
+IMPORTANT COMPENSATION RULES:
+1. When executing multiple payments as part of a single request (e.g., splitting a bill), treat them as a transaction.
+2. If ANY payment in a multi-payment request fails, you MUST request refunds for ALL previously successful payments in that request.
+3. To request a refund, use the request_refund tool with the same email and amount as the original payment.
+4. Always report what happened: which payments succeeded, which failed, and what compensations were made.
+
+Example: If asked to pay A, B, and C, and payment to C fails:
+- Payment to A: Success
+- Payment to B: Success
+- Payment to C: Failed (user not found)
+- Action: Request refund from A, request refund from B
+- Result: All payments rolled back due to failure
+
+Use the provided tools to complete tasks. Call complete_task() when done."""
 
         self.agent = create_comp_agent(
             self.llm,
@@ -480,7 +495,7 @@ print(login_result['access_token'])
                 traceback.print_exc()
                 result = {"error": str(e), "type": type(e).__name__}
 
-        # Print compensation log
+        # Print compensation log with detailed analysis
         print("\n" + "="*60)
         print("COMPENSATION LOG")
         print("="*60)
@@ -488,9 +503,51 @@ print(login_result['access_token'])
             log_dict = self.comp_log.to_dict()
             print(json.dumps(log_dict, indent=2, default=str))
             if log_dict:
-                print(f"\nTotal compensatable actions: {len(log_dict)}")
-                compensated = sum(1 for v in log_dict.values() if v.get('compensated'))
-                print(f"Compensated actions: {compensated}")
+                print(f"\n{'─'*40}")
+                print("COMPENSATION SUMMARY")
+                print(f"{'─'*40}")
+
+                successful_payments = []
+                failed_payments = []
+                compensated_payments = []
+
+                for entry_id, entry in log_dict.items():
+                    tool_name = entry.get('tool_name', 'unknown')
+                    params = entry.get('params', {})
+                    result = entry.get('result', {})
+                    compensated = entry.get('compensated', False)
+
+                    # Check if it was a successful payment
+                    if tool_name == 'send_payment':
+                        is_success = isinstance(result, dict) and result.get('transaction_id')
+                        if is_success:
+                            if compensated:
+                                compensated_payments.append(params)
+                            else:
+                                successful_payments.append(params)
+                        else:
+                            failed_payments.append(params)
+
+                print(f"Successful payments (not compensated): {len(successful_payments)}")
+                for p in successful_payments:
+                    print(f"  → ${p.get('amount', '?')} to {p.get('receiver_email', '?')}")
+
+                print(f"Failed payments: {len(failed_payments)}")
+                for p in failed_payments:
+                    print(f"  ✗ ${p.get('amount', '?')} to {p.get('receiver_email', '?')}")
+
+                print(f"Compensated (refund requested): {len(compensated_payments)}")
+                for p in compensated_payments:
+                    print(f"  ↩ ${p.get('amount', '?')} from {p.get('receiver_email', '?')}")
+
+                print(f"{'─'*40}")
+                if successful_payments and failed_payments:
+                    print("⚠️  WARNING: Some payments succeeded but others failed!")
+                    print("    You may want to request refunds for consistency.")
+                elif not successful_payments and not failed_payments:
+                    print("ℹ️  No payment transactions in log")
+                elif compensated_payments:
+                    print("✓ Compensation completed - payments were rolled back")
         except Exception as e:
             print(f"Error printing log: {e}")
         print("="*60 + "\n")
